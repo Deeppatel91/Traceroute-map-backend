@@ -1,0 +1,19 @@
+{
+    "type": "FeatureCollection",
+    "features": [
+      {
+        "type": "Feature",
+        "properties": {
+          "name": "TAT-14 (Atlantic)",
+          "length": 15000
+        },
+        "geometry": {
+          "type": "LineString",
+          "coordinates": [
+            [-74.0060, 40.7128],
+            [-0.1276, 51.5074]
+          ]
+        }
+      }
+    ]
+  }
