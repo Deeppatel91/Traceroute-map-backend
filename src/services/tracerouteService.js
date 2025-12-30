@@ -46,8 +46,8 @@ class TracerouteService {
       // Step 5: Detect CDN/Cloudflare
       const cdnInfo = this.detectCDN(enrichedHops);
 
-      // Step 6: Analyze submarine cables
-      const cableInfo = cableService.analyzeCableUsage(enrichedHops);
+      // Step 6: Analyze submarine cables (AWAIT THIS!)
+      const cableInfo = await cableService.analyzeCableUsage(enrichedHops);
 
       // Step 7: Calculate total time
       const totalTime = this.calculateTotalTime(enrichedHops);
@@ -64,7 +64,7 @@ class TracerouteService {
         hasCdn: cdnInfo.detected,
         cdnProvider: cdnInfo.provider,
         hops: enrichedHops,
-        cables: cableInfo,
+        cables: cableInfo, // This will now be an array
         timestamp: new Date().toISOString()
       };
 
@@ -150,7 +150,6 @@ class TracerouteService {
       // Match pattern: "  1    <1 ms    <1 ms    <1 ms  192.168.1.1"
       // or: "  2     *        *        *     Request timed out."
       const ipMatch = line.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
-      const timeMatch = line.match(/(\d+)\s*ms/);
       
       if (ipMatch) {
         const ip = ipMatch[1];
