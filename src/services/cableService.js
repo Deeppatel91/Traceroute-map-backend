@@ -7,22 +7,16 @@ class CableService {
     this.landingPoints = [];
     this.cableMetadata = [];
     this.lastFetch = null;
-    this.cacheDuration = 24 * 60 * 60 * 1000; // Cache for 24 hours
+    this.cacheDuration = 24 * 60 * 60 * 1000;
     this.isLoading = false;
     this.loadAttempted = false;
     
-    // Initialize by loading data
     this.initPromise = this.loadCables();
   }
 
-  /**
-   * Load submarine cable data from Submarine Cable Map API
-   */
   async loadCables() {
-    // Prevent multiple simultaneous loads
     if (this.isLoading) {
       console.log('⏳ Cable data is already loading...');
-      // Wait for the existing load to complete
       while (this.isLoading) {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
@@ -30,7 +24,6 @@ class CableService {
     }
 
     try {
-      // Check if cache is still valid
       if (this.lastFetch && (Date.now() - this.lastFetch < this.cacheDuration) && this.cables.length > 0) {
         console.log(`✅ Using cached submarine cable data (${this.cables.length} cables)`);
         return;
@@ -40,7 +33,6 @@ class CableService {
       this.loadAttempted = true;
       console.log('🌊 Fetching submarine cable data from API...');
 
-      // Fetch all three endpoints in parallel with longer timeout
       const [cableGeoResponse, landingPointResponse, cableMetadataResponse] = await Promise.all([
         axios.get('https://www.submarinecablemap.com/api/v3/cable/cable-geo.json', { 
           timeout: 20000,
@@ -65,7 +57,6 @@ class CableService {
       console.log(`✅ Loaded ${this.landingPoints.length} landing points`);
       console.log(`✅ Loaded metadata for ${this.cableMetadata.length} cables`);
 
-      // Log a few sample cables for verification
       if (this.cables.length > 0) {
         console.log('📝 Sample cables:', this.cables.slice(0, 3).map(c => c.properties?.name));
       }
@@ -74,10 +65,8 @@ class CableService {
       console.error('❌ Failed to load cable data from API:', error.message);
       if (error.response) {
         console.error('   Response status:', error.response.status);
-        console.error('   Response data:', error.response.data);
       }
       
-      // Keep existing data if we have it
       if (this.cables.length === 0) {
         console.warn('⚠️  No cable data available. Cable detection disabled.');
       }
@@ -86,44 +75,216 @@ class CableService {
     }
   }
 
-  /**
-   * Get enriched cable metadata by matching with the metadata API
-   */
-  getCableMetadata(cableName) {
-    if (!cableName) return null;
+  getCableMetadata(cableId) {
+    if (!cableId) return null;
     
-    const normalizedName = cableName.toLowerCase().trim();
+    const normalizedId = cableId.toLowerCase().trim();
     
     return this.cableMetadata.find(cable => {
-      if (!cable.name) return false;
-      const cableNameLower = cable.name.toLowerCase().trim();
-      return cableNameLower === normalizedName ||
-             cableNameLower.includes(normalizedName) ||
-             normalizedName.includes(cableNameLower) ||
-             cable.cable_id === cableName ||
-             cable.slug === cableName;
+      if (!cable.cable_id && !cable.slug && !cable.name) return false;
+      
+      const id = (cable.cable_id || cable.slug || '').toLowerCase().trim();
+      const name = (cable.name || '').toLowerCase().trim();
+      
+      return id === normalizedId || 
+             name === normalizedId ||
+             id.includes(normalizedId) ||
+             normalizedId.includes(id);
     });
   }
 
   /**
-   * Analyze if hops use submarine cables
+   * Check if a route is a valid submarine cable route
+   * Returns true only if the route crosses water AND matches a cable
    */
+  isSubmarineCableRoute(hop1, hop2, distance) {
+    // Skip if either hop has no coordinates
+    if (!hop1.lat || !hop2.lat || !hop1.country || !hop2.country) {
+      return false;
+    }
+
+    // CRITICAL: Routes within the same country are LAND routes (except for special cases)
+    if (hop1.country === hop2.country) {
+      // Exception: Very long distances within large countries that cross water
+      // (e.g., US mainland to Hawaii, Indonesia between islands)
+      const largCountries = ['US', 'ID', 'PH', 'MY', 'JP'];
+      
+      if (!largCountries.includes(hop1.country) || distance < 1000) {
+        console.log(`   ⛔ SAME COUNTRY (${hop1.country}), distance ${Math.round(distance)}km - LAND ROUTE`);
+        return false;
+      }
+    }
+
+    // Must have significant distance (minimum 500km for intercontinental)
+    if (distance < 500) {
+      console.log(`   ⛔ Short distance (${Math.round(distance)}km) - LAND ROUTE`);
+      return false;
+    }
+
+    // Check if countries are on different continents or separated by ocean
+    const crossesOcean = this.routeCrossesOcean(hop1, hop2);
+    
+    if (!crossesOcean) {
+      console.log(`   ⛔ Does not cross ocean - LAND ROUTE`);
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Determine if route crosses an ocean (requires submarine cable)
+   */
+  routeCrossesOcean(hop1, hop2) {
+    const continent1 = this.getContinent(hop1.country);
+    const continent2 = this.getContinent(hop2.country);
+
+    // Different continents = likely ocean crossing
+    if (continent1 !== continent2) {
+      // Special case: Europe to Asia via land is possible
+      if ((continent1 === 'Europe' && continent2 === 'Asia') ||
+          (continent1 === 'Asia' && continent2 === 'Europe')) {
+        // Check if route goes through Russia/Turkey (land) or crosses Mediterranean/Atlantic (sea)
+        const avgLat = (hop1.lat + hop2.lat) / 2;
+        const avgLon = (hop1.lon + hop2.lon) / 2;
+        
+        // If route is in northern latitudes (>40°) and eastern hemisphere, likely land
+        if (avgLat > 40 && avgLon > 30 && avgLon < 180) {
+          return false; // Trans-Siberian route
+        }
+      }
+      
+      console.log(`   🌊 Different continents: ${continent1} → ${continent2}`);
+      return true;
+    }
+
+    // Same continent but check for specific ocean-separated countries
+    const oceanSeparated = this.areCountriesOceanSeparated(hop1.country, hop2.country);
+    if (oceanSeparated) {
+      console.log(`   🌊 Ocean-separated countries: ${hop1.country} → ${hop2.country}`);
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Map country codes to continents
+   */
+  getContinent(countryCode) {
+    const continentMap = {
+      // North America
+      'US': 'North America', 'CA': 'North America', 'MX': 'North America',
+      'GT': 'North America', 'BZ': 'North America', 'SV': 'North America',
+      'HN': 'North America', 'NI': 'North America', 'CR': 'North America',
+      'PA': 'North America', 'CU': 'North America', 'JM': 'North America',
+      
+      // South America
+      'BR': 'South America', 'AR': 'South America', 'CL': 'South America',
+      'CO': 'South America', 'VE': 'South America', 'PE': 'South America',
+      'EC': 'South America', 'BO': 'South America', 'PY': 'South America',
+      'UY': 'South America', 'GY': 'South America', 'SR': 'South America',
+      
+      // Europe
+      'GB': 'Europe', 'FR': 'Europe', 'DE': 'Europe', 'IT': 'Europe',
+      'ES': 'Europe', 'PT': 'Europe', 'NL': 'Europe', 'BE': 'Europe',
+      'SE': 'Europe', 'NO': 'Europe', 'DK': 'Europe', 'FI': 'Europe',
+      'PL': 'Europe', 'CZ': 'Europe', 'AT': 'Europe', 'CH': 'Europe',
+      'IE': 'Europe', 'GR': 'Europe', 'RO': 'Europe', 'HU': 'Europe',
+      
+      // Asia
+      'CN': 'Asia', 'JP': 'Asia', 'IN': 'Asia', 'KR': 'Asia',
+      'TH': 'Asia', 'VN': 'Asia', 'MY': 'Asia', 'SG': 'Asia',
+      'ID': 'Asia', 'PH': 'Asia', 'PK': 'Asia', 'BD': 'Asia',
+      'IR': 'Asia', 'IQ': 'Asia', 'SA': 'Asia', 'AE': 'Asia',
+      'TR': 'Asia', 'IL': 'Asia', 'TW': 'Asia', 'HK': 'Asia',
+      
+      // Africa
+      'ZA': 'Africa', 'EG': 'Africa', 'NG': 'Africa', 'KE': 'Africa',
+      'MA': 'Africa', 'DZ': 'Africa', 'TN': 'Africa', 'LY': 'Africa',
+      'ET': 'Africa', 'GH': 'Africa', 'CI': 'Africa', 'CM': 'Africa',
+      
+      // Oceania
+      'AU': 'Oceania', 'NZ': 'Oceania', 'FJ': 'Oceania', 'PG': 'Oceania',
+    };
+
+    return continentMap[countryCode] || 'Unknown';
+  }
+
+  /**
+   * Check if two countries are separated by ocean despite being on same continent
+   */
+  areCountriesOceanSeparated(country1, country2) {
+    // Islands separated from mainland
+    const oceanSeparatedPairs = [
+      // UK to/from Europe mainland
+      ['GB', 'FR'], ['GB', 'DE'], ['GB', 'NL'], ['GB', 'BE'],
+      ['GB', 'ES'], ['GB', 'IT'], ['GB', 'IE'],
+      
+      // Japan to/from Asia mainland
+      ['JP', 'CN'], ['JP', 'KR'], ['JP', 'RU'],
+      
+      // Indonesia islands
+      ['ID', 'SG'], ['ID', 'MY'], ['ID', 'AU'],
+      
+      // Philippines
+      ['PH', 'CN'], ['PH', 'TW'], ['PH', 'JP'],
+      
+      // Australia/NZ to Asia
+      ['AU', 'SG'], ['AU', 'ID'], ['NZ', 'AU'],
+      
+      // Iceland
+      ['IS', 'GB'], ['IS', 'NO'], ['IS', 'US'],
+    ];
+
+    // Check both directions
+    return oceanSeparatedPairs.some(pair => 
+      (pair[0] === country1 && pair[1] === country2) ||
+      (pair[0] === country2 && pair[1] === country1)
+    );
+  }
+
+  /**
+   * Find cable that matches this route
+   */
+  findMatchingCable(lat1, lon1, lat2, lon2) {
+    const threshold = 200; // Stricter threshold - 200km
+    let bestMatch = null;
+    let minDistance = Infinity;
+
+    for (const cable of this.cables) {
+      if (!cable.geometry || !cable.geometry.coordinates) continue;
+      
+      const coordinates = cable.geometry.type === 'MultiLineString' 
+        ? cable.geometry.coordinates[0] 
+        : cable.geometry.coordinates;
+      
+      if (!coordinates || coordinates.length < 2) continue;
+
+      const distance = this.calculateRouteProximity(lat1, lon1, lat2, lon2, coordinates);
+      
+      if (distance < minDistance && distance < threshold) {
+        minDistance = distance;
+        bestMatch = { cable, distance };
+      }
+    }
+
+    return bestMatch;
+  }
+
   async analyzeCableUsage(hops) {
     console.log('\n🔍 ========== CABLE ANALYSIS START ==========');
     
-    // Ensure we have data loaded
     if (!this.loadAttempted) {
       console.log('⏳ First load - waiting for cable data...');
       await this.initPromise;
     }
     
-    // If still no data, try loading again
     if (this.cables.length === 0 && !this.isLoading) {
       console.log('⚠️  No cable data found, attempting reload...');
       await this.loadCables();
     }
 
-    // If STILL no data, return empty array
     if (this.cables.length === 0) {
       console.error('❌ No cable data available for analysis');
       console.log('🔍 ========== CABLE ANALYSIS END (NO DATA) ==========\n');
@@ -145,85 +306,71 @@ class CableService {
 
       if (!hop1.lat || !hop2.lat) {
         console.log(`⏭️  SKIP: Missing coordinates`);
-        console.log(`   Hop ${hop1.hop}: lat=${hop1.lat}, lon=${hop1.lon}`);
-        console.log(`   Hop ${hop2.hop}: lat=${hop2.lat}, lon=${hop2.lon}`);
+        hop1.routeType = 'land';
         continue;
       }
 
-      // Check if route crosses ocean
       const distance = this.calculateDistance(hop1.lat, hop1.lon, hop2.lat, hop2.lon);
       
-      console.log(`📍 Hop ${hop1.hop}: ${hop1.city || 'Unknown'}, ${hop1.country || 'Unknown'} (${hop1.lat.toFixed(4)}, ${hop1.lon.toFixed(4)})`);
-      console.log(`📍 Hop ${hop2.hop}: ${hop2.city || 'Unknown'}, ${hop2.country || 'Unknown'} (${hop2.lat.toFixed(4)}, ${hop2.lon.toFixed(4)})`);
+      console.log(`📍 Hop ${hop1.hop}: ${hop1.city || 'Unknown'}, ${hop1.country || 'Unknown'}`);
+      console.log(`📍 Hop ${hop2.hop}: ${hop2.city || 'Unknown'}, ${hop2.country || 'Unknown'}`);
       console.log(`📏 Distance: ${Math.round(distance)} km`);
-      console.log(`🌍 Countries: ${hop1.country} → ${hop2.country}`);
-      console.log(`🌊 Route type: ${hop1.routeType || 'unknown'}`);
       
-      // Check multiple criteria for submarine cable detection
-      const isDifferentCountry = hop1.country !== hop2.country;
-      const isLongDistance = distance > 800;
-      const isMarkedAsSea = hop1.routeType === 'sea';
+      // Step 1: Check if this COULD be a submarine cable route
+      const couldBeSubmarineCable = this.isSubmarineCableRoute(hop1, hop2, distance);
       
-      console.log(`\n🔍 Detection criteria:`);
-      console.log(`   - Distance > 800km: ${isLongDistance} (${Math.round(distance)} km)`);
-      console.log(`   - Different countries: ${isDifferentCountry}`);
-      console.log(`   - Marked as sea route: ${isMarkedAsSea}`);
+      if (!couldBeSubmarineCable) {
+        hop1.routeType = 'land';
+        console.log(`✅ Classified as: LAND ROUTE`);
+        continue;
+      }
       
-      // Submarine cable likely if:
-      // 1. Distance > 800km AND different countries, OR
-      // 2. Marked as sea route AND distance > 500km
-      const isSubmarineCableRoute = (isLongDistance && isDifferentCountry) || (isMarkedAsSea && distance > 500);
+      // Step 2: If it could be submarine, try to find matching cable
+      console.log(`🔎 Could be submarine cable - searching for match...`);
+      const cableMatch = this.findMatchingCable(hop1.lat, hop1.lon, hop2.lat, hop2.lon);
       
-      if (isSubmarineCableRoute) {
-        console.log(`✅ SUBMARINE CABLE ROUTE DETECTED!`);
-        console.log(`🔎 Searching ${this.cables.length} cables for match...`);
+      if (cableMatch) {
+        const cable = cableMatch.cable;
+        const cableId = cable.properties?.id || cable.properties?.cable_id;
+        const cableName = cable.properties?.name || 'Unknown Cable';
         
-        const cable = this.findNearestCable(hop1, hop2);
+        console.log(`✅ *** SUBMARINE CABLE CONFIRMED: ${cableName} ***`);
+        console.log(`   Distance to cable: ${Math.round(cableMatch.distance)} km`);
         
-        if (cable) {
-          const cableName = cable.properties?.name || 'Unknown Cable';
-          const cableId = cable.properties?.id || cable.properties?.cable_id || cableName;
+        hop1.routeType = 'sea';
+        hop1.cableUsed = cableName;
+        
+        if (!usedCableIds.has(cableId)) {
+          usedCableIds.add(cableId);
           
-          console.log(`\n✅ *** CABLE FOUND: ${cableName} ***`);
+          const metadata = this.getCableMetadata(cableId);
           
-          // Only add if not already detected
-          if (!usedCableIds.has(cableId)) {
-            usedCableIds.add(cableId);
-            
-            // Get additional metadata
-            const metadata = this.getCableMetadata(cableName);
-            
-            const cableInfo = {
-              id: cableId,
-              name: cableName,
-              from: hop1.country,
-              to: hop2.country,
-              fromCity: hop1.city || 'Unknown',
-              toCity: hop2.city || 'Unknown',
-              hopRange: `${hop1.hop}-${hop2.hop}`,
-              distance: Math.round(distance),
-              length: metadata?.length || cable.properties?.length || 'N/A',
-              rfs: metadata?.rfs_year || cable.properties?.rfs || 'N/A',
-              owners: metadata?.owners?.[0]?.name || cable.properties?.owners || 'N/A',
-              url: metadata?.url || null,
-              capacity: metadata?.capacity_tbps || null
-            };
-            
-            cablesUsed.push(cableInfo);
-            
-            console.log(`📋 Cable details:`, JSON.stringify(cableInfo, null, 2));
-          } else {
-            console.log(`⏭️  Cable ${cableName} already recorded, skipping duplicate`);
-          }
+          const cableInfo = {
+            id: cableId,
+            name: cableName,
+            from: hop1.country,
+            to: hop2.country,
+            fromCity: hop1.city || 'Unknown',
+            toCity: hop2.city || 'Unknown',
+            hopRange: `${hop1.hop}-${hop2.hop}`,
+            distance: Math.round(distance),
+            length: metadata?.length || 'N/A',
+            rfs: metadata?.ready_for_service || metadata?.rfs || 'N/A',
+            owners: this.extractOwners(metadata),
+            url: metadata?.url || `https://www.submarinecablemap.com/submarine-cable/${cableId}`,
+            color: cable.properties?.color || '#939597'
+          };
+          
+          cablesUsed.push(cableInfo);
+          console.log(`📋 Cable details:`, JSON.stringify(cableInfo, null, 2));
         } else {
-          console.log(`❌ NO CABLE FOUND within threshold`);
-          console.log(`   This could mean:`);
-          console.log(`   - Cable route doesn't match database geometry`);
-          console.log(`   - Route uses a cable not in the database`);
-          console.log(`   - Distance threshold (1000km) too restrictive`);
+          console.log(`⏭️  Cable ${cableName} already recorded`);
         }
       } else {
-        console.log(`⏭️  SKIP: Not a submarine cable route`);
+        // Ocean crossing but no cable found - likely using a cable not in database
+        hop1.routeType = 'sea';
+        hop1.cableUsed = 'Unknown Cable';
+        console.log(`⚠️  Ocean crossing detected but no cable match found in database`);
       }
     }
 
@@ -237,103 +384,40 @@ class CableService {
     return cablesUsed;
   }
 
-  /**
-   * Find nearest cable between two hops using point-to-line distance
-   */
-  findNearestCable(hop1, hop2) {
-    if (this.cables.length === 0) {
-      console.log('   ⚠️  No cables loaded');
-      return null;
-    }
-
-    let nearestCable = null;
-    let minDistance = Infinity;
-    const threshold = 1000; // Increased from 500km to 1000km for better detection
+  extractOwners(metadata) {
+    if (!metadata) return 'N/A';
     
-    let cablesChecked = 0;
-    let validCables = 0;
-
-    for (const cable of this.cables) {
-      cablesChecked++;
-      
-      // Skip if cable doesn't have valid geometry
-      if (!cable.geometry || 
-          cable.geometry.type !== 'LineString' || 
-          !cable.geometry.coordinates ||
-          cable.geometry.coordinates.length < 2) {
-        continue;
-      }
-      
-      validCables++;
-
-      // Calculate minimum distance from hop route to cable
-      const distance = this.calculateRouteProximity(
-        hop1.lat, hop1.lon,
-        hop2.lat, hop2.lon,
-        cable.geometry.coordinates
-      );
-
-      if (distance < minDistance) {
-        minDistance = distance;
-        if (distance < threshold) {
-          nearestCable = cable;
-        }
-      }
+    if (metadata.owners && Array.isArray(metadata.owners)) {
+      return metadata.owners.slice(0, 3).map(o => o.name || o).join(', ');
     }
-
-    console.log(`   📊 Cables checked: ${cablesChecked}, Valid cables: ${validCables}`);
-    console.log(`   🎯 Nearest cable distance: ${Math.round(minDistance)} km`);
-    console.log(`   🎯 Threshold: ${threshold} km`);
-
-    if (nearestCable) {
-      console.log(`   ✅ Match found: ${nearestCable.properties?.name} (${Math.round(minDistance)} km away)`);
-    } else {
-      console.log(`   ❌ No cable within ${threshold}km threshold`);
-      if (minDistance < Infinity) {
-        console.log(`   ℹ️  Closest cable was ${Math.round(minDistance)} km away`);
-      }
-    }
-
-    return nearestCable;
+    
+    if (metadata.owner) return metadata.owner;
+    
+    return 'N/A';
   }
 
-  /**
-   * Calculate proximity between a hop route and a cable line
-   */
   calculateRouteProximity(lat1, lon1, lat2, lon2, cableCoordinates) {
-    // Calculate midpoint of the hop route
     const midLat = (lat1 + lat2) / 2;
     const midLon = (lon1 + lon2) / 2;
 
-    // Also check endpoints
     let minDist = Infinity;
 
-    // Check distance from route midpoint to cable
     for (let i = 0; i < cableCoordinates.length - 1; i++) {
       const cableLon1 = cableCoordinates[i][0];
       const cableLat1 = cableCoordinates[i][1];
       const cableLon2 = cableCoordinates[i + 1][0];
       const cableLat2 = cableCoordinates[i + 1][1];
 
-      // Distance from hop midpoint to cable segment
       const distMid = this.pointToSegmentDistance(
-        midLat, midLon,
-        cableLat1, cableLon1,
-        cableLat2, cableLon2
+        midLat, midLon, cableLat1, cableLon1, cableLat2, cableLon2
       );
 
-      // Distance from hop start point to cable segment
       const distStart = this.pointToSegmentDistance(
-        lat1, lon1,
-        cableLat1, cableLon1,
-        cableLat2, cableLon2
+        lat1, lon1, cableLat1, cableLon1, cableLat2, cableLon2
       );
 
-      // Distance from hop end point to cable segment
       const distEnd = this.pointToSegmentDistance(
-        lat2, lon2,
-        cableLat1, cableLon1,
-        cableLat2, cableLon2
+        lat2, lon2, cableLat1, cableLon1, cableLat2, cableLon2
       );
 
       minDist = Math.min(minDist, distMid, distStart, distEnd);
@@ -342,43 +426,28 @@ class CableService {
     return minDist;
   }
 
-  /**
-   * Calculate distance from a point to a line segment
-   */
   pointToSegmentDistance(pLat, pLon, aLat, aLon, bLat, bLon) {
     const distPA = this.calculateDistance(pLat, pLon, aLat, aLon);
     const distPB = this.calculateDistance(pLat, pLon, bLat, bLon);
     const distAB = this.calculateDistance(aLat, aLon, bLat, bLon);
 
-    // If segment is very short, return distance to nearest endpoint
-    if (distAB < 1) {
-      return Math.min(distPA, distPB);
-    }
+    if (distAB < 1) return Math.min(distPA, distPB);
 
-    // Calculate perpendicular distance using Heron's formula
     const s = (distPA + distPB + distAB) / 2;
     const area = Math.sqrt(Math.max(0, s * (s - distPA) * (s - distPB) * (s - distAB)));
     const perpDist = (2 * area) / distAB;
 
-    // Check if perpendicular point lies on segment
     const dotProduct = 
       ((pLat - aLat) * (bLat - aLat) + (pLon - aLon) * (bLon - aLon)) /
       (distAB * distAB);
 
-    if (dotProduct < 0) {
-      return distPA;
-    } else if (dotProduct > 1) {
-      return distPB;
-    } else {
-      return perpDist;
-    }
+    if (dotProduct < 0) return distPA;
+    if (dotProduct > 1) return distPB;
+    return perpDist;
   }
 
-  /**
-   * Calculate distance between coordinates using Haversine formula
-   */
   calculateDistance(lat1, lon1, lat2, lon2) {
-    const R = 6371; // Earth radius in km
+    const R = 6371;
     const dLat = this.toRadians(lat2 - lat1);
     const dLon = this.toRadians(lon2 - lon1);
 
@@ -394,55 +463,6 @@ class CableService {
     return degrees * (Math.PI / 180);
   }
 
-  /**
-   * Get cable details by ID or name
-   */
-  getCableById(cableId) {
-    return this.cables.find(cable => 
-      cable.properties?.cable_id === cableId || 
-      cable.properties?.id === cableId ||
-      cable.properties?.name === cableId
-    );
-  }
-
-  /**
-   * Get all cables in a geographic region
-   */
-  getCablesInRegion(minLat, maxLat, minLon, maxLon) {
-    return this.cables.filter(cable => {
-      if (!cable.geometry?.coordinates) return false;
-
-      // Check if any cable point falls within the region
-      return cable.geometry.coordinates.some(coord => {
-        const [lon, lat] = coord;
-        return lat >= minLat && lat <= maxLat && lon >= minLon && lon <= maxLon;
-      });
-    });
-  }
-
-  /**
-   * Find landing points near a coordinate
-   */
-  findNearbyLandingPoints(lat, lon, radiusKm = 200) {
-    return this.landingPoints.filter(point => {
-      if (!point.geometry?.coordinates) return false;
-      
-      const [pLon, pLat] = point.geometry.coordinates;
-      const distance = this.calculateDistance(lat, lon, pLat, pLon);
-      
-      return distance <= radiusKm;
-    }).map(point => ({
-      name: point.properties?.name,
-      city: point.properties?.city,
-      country: point.properties?.country,
-      coordinates: point.geometry.coordinates,
-      distance: this.calculateDistance(lat, lon, point.geometry.coordinates[1], point.geometry.coordinates[0])
-    }));
-  }
-
-  /**
-   * Refresh cable data (force reload)
-   */
   async refreshData() {
     console.log('🔄 Forcing cable data refresh...');
     this.lastFetch = null;

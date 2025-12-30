@@ -19,7 +19,6 @@ class TracerouteService {
    */
   async traceRoute(domain) {
     try {
-      // Step 1: Resolve domain to IP
       const targetIp = await this.resolveDomain(domain);
       
       if (!targetIp) {
@@ -28,7 +27,6 @@ class TracerouteService {
 
       console.log(`✅ Resolved ${domain} → ${targetIp}`);
 
-      // Step 2: Run traceroute
       const hops = await this.runTraceroute(targetIp);
 
       if (!hops || hops.length === 0) {
@@ -37,19 +35,19 @@ class TracerouteService {
 
       console.log(`✅ Found ${hops.length} hops`);
 
-      // Step 3: Enrich each hop with geo + ASN data
+      // Enrich each hop with geo + ASN data
       const enrichedHops = await this.enrichHops(hops);
 
-      // Step 4: Calculate distances
-      const distances = this.calculateDistances(enrichedHops);
-
-      // Step 5: Detect CDN/Cloudflare
-      const cdnInfo = this.detectCDN(enrichedHops);
-
-      // Step 6: Analyze submarine cables (AWAIT THIS!)
+      // Analyze submarine cables - this will also set routeType for each hop
       const cableInfo = await cableService.analyzeCableUsage(enrichedHops);
 
-      // Step 7: Calculate total time
+      // Calculate distances AFTER cable analysis (so we have routeType set)
+      const distances = this.calculateDistances(enrichedHops);
+
+      // Detect CDN/Cloudflare
+      const cdnInfo = this.detectCDN(enrichedHops);
+
+      // Calculate total time
       const totalTime = this.calculateTotalTime(enrichedHops);
 
       return {
@@ -64,7 +62,7 @@ class TracerouteService {
         hasCdn: cdnInfo.detected,
         cdnProvider: cdnInfo.provider,
         hops: enrichedHops,
-        cables: cableInfo, // This will now be an array
+        cables: cableInfo,
         timestamp: new Date().toISOString()
       };
 
@@ -75,11 +73,10 @@ class TracerouteService {
   }
 
   /**
-   * Resolve domain to IP address (Windows compatible using Node.js DNS)
+   * Resolve domain to IP address
    */
   async resolveDomain(domain) {
     try {
-      // Use Node.js built-in DNS resolver (cross-platform)
       const addresses = await dns.resolve4(domain);
       
       if (addresses && addresses.length > 0) {
@@ -94,25 +91,23 @@ class TracerouteService {
   }
 
   /**
-   * Run system traceroute command (Windows/Linux compatible)
+   * Run system traceroute command
    */
   async runTraceroute(ip) {
     try {
       let command;
       
       if (this.isWindows) {
-        // Windows: use tracert
         command = `tracert -d -h 30 -w 1000 ${ip}`;
         console.log(`🔍 Running: ${command}`);
         
         const { stdout } = await execAsync(command, { 
           timeout: 60000,
-          maxBuffer: 1024 * 1024 * 10 // 10MB buffer
+          maxBuffer: 1024 * 1024 * 10
         });
         
         return this.parseWindowsTracert(stdout);
       } else {
-        // Linux/Mac: try mtr first, fallback to traceroute
         try {
           command = `mtr --report --report-cycles 3 --no-dns ${ip}`;
           const { stdout } = await execAsync(command, { timeout: 30000 });
@@ -139,7 +134,6 @@ class TracerouteService {
     let hopNumber = 1;
 
     for (const line of lines) {
-      // Skip header and footer lines
       if (line.includes('Tracing route') || 
           line.includes('over a maximum') || 
           line.includes('Trace complete') ||
@@ -147,14 +141,10 @@ class TracerouteService {
         continue;
       }
 
-      // Match pattern: "  1    <1 ms    <1 ms    <1 ms  192.168.1.1"
-      // or: "  2     *        *        *     Request timed out."
       const ipMatch = line.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
       
       if (ipMatch) {
         const ip = ipMatch[1];
-        
-        // Extract RTT (use last time value, or average if multiple)
         const allTimes = [...line.matchAll(/(\d+)\s*ms/g)];
         let rtt = 0;
         
@@ -170,7 +160,6 @@ class TracerouteService {
           loss: 0
         });
       } else if (line.match(/^\s*\d+\s+\*/)) {
-        // Timeout hop - skip or mark as unreachable
         hopNumber++;
       }
     }
@@ -179,7 +168,7 @@ class TracerouteService {
   }
 
   /**
-   * Parse mtr output (Linux/Mac)
+   * Parse mtr output
    */
   parseMtrOutput(output) {
     const lines = output.split('\n');
@@ -203,7 +192,7 @@ class TracerouteService {
   }
 
   /**
-   * Parse standard traceroute output (Linux/Mac)
+   * Parse standard traceroute output
    */
   parseTracerouteOutput(output) {
     const lines = output.split('\n');
@@ -249,7 +238,9 @@ class TracerouteService {
         asn: asn.asn,
         asnOrg: asn.org,
         isCdn: asn.isCdn,
-        cdnProvider: asn.cdnProvider
+        cdnProvider: asn.cdnProvider,
+        routeType: 'land', // Default to land, will be updated by cable analysis
+        cableUsed: null
       });
     }
 
@@ -258,6 +249,7 @@ class TracerouteService {
 
   /**
    * Calculate distances between hops
+   * NOTE: routeType is now set by cable analysis, not by distance heuristic
    */
   calculateDistances(hops) {
     let totalDistance = 0;
@@ -275,7 +267,8 @@ class TracerouteService {
         hop2.lat, hop2.lon
       );
 
-      const isSea = this.isSeaRoute(hop1, hop2, distance);
+      // Use the routeType that was set by cable analysis
+      const isSea = hop1.routeType === 'sea';
 
       if (isSea) {
         seaDistance += distance;
@@ -284,9 +277,7 @@ class TracerouteService {
       }
 
       totalDistance += distance;
-
-      hops[i].distanceToNext = distance;
-      hops[i].routeType = isSea ? 'sea' : 'land';
+      hop1.distanceToNext = distance;
     }
 
     return {
@@ -300,7 +291,7 @@ class TracerouteService {
    * Haversine formula for distance calculation
    */
   haversineDistance(lat1, lon1, lat2, lon2) {
-    const R = 6371; // Earth radius in km
+    const R = 6371;
     const dLat = this.toRadians(lat2 - lat1);
     const dLon = this.toRadians(lon2 - lon1);
 
@@ -314,18 +305,6 @@ class TracerouteService {
 
   toRadians(degrees) {
     return degrees * (Math.PI / 180);
-  }
-
-  /**
-   * Determine if route is over sea
-   */
-  isSeaRoute(hop1, hop2, distance) {
-    if (distance > 800) {
-      if (hop1.country !== hop2.country) {
-        return true;
-      }
-    }
-    return false;
   }
 
   /**
