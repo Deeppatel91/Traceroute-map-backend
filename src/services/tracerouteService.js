@@ -47,7 +47,7 @@ class TracerouteService {
       // Detect CDN/Cloudflare
       const cdnInfo = this.detectCDN(enrichedHops);
 
-      // Calculate total time
+      // Calculate total time - use the last hop's RTT
       const totalTime = this.calculateTotalTime(enrichedHops);
 
       return {
@@ -91,49 +91,66 @@ class TracerouteService {
   }
 
   /**
-   * Run system traceroute command
+   * Run system traceroute command - FIXED VERSION
    */
   async runTraceroute(ip) {
     try {
       let command;
       
       if (this.isWindows) {
-        command = `tracert -d -h 30 -w 1000 ${ip}`;
+        // FIXED: Reduced max hops and increased timeout significantly
+        command = `tracert -d -h 20 -w 5000 ${ip}`;
         console.log(`🔍 Running: ${command}`);
         
         const { stdout } = await execAsync(command, { 
-          timeout: 60000,
-          maxBuffer: 1024 * 1024 * 10
+          timeout: 120000, // 2 minutes - increased from 90 seconds
+          maxBuffer: 1024 * 1024 * 10,
+          windowsHide: true // Hide command window
         });
         
         return this.parseWindowsTracert(stdout);
       } else {
         try {
           command = `mtr --report --report-cycles 3 --no-dns ${ip}`;
-          const { stdout } = await execAsync(command, { timeout: 30000 });
+          const { stdout } = await execAsync(command, { timeout: 45000 });
           return this.parseMtrOutput(stdout);
         } catch (mtrError) {
-          command = `traceroute -n -q 1 -m 30 ${ip}`;
-          const { stdout } = await execAsync(command, { timeout: 30000 });
+          command = `traceroute -n -q 3 -m 20 -w 5 ${ip}`;
+          const { stdout } = await execAsync(command, { timeout: 60000 });
           return this.parseTracerouteOutput(stdout);
         }
       }
 
     } catch (error) {
       console.error('Traceroute execution failed:', error.message);
+      
+      // Return partial results if available
+      if (error.stdout) {
+        console.log('⚠️  Attempting to parse partial output...');
+        if (this.isWindows) {
+          const partialHops = this.parseWindowsTracert(error.stdout);
+          if (partialHops.length > 0) {
+            console.log(`✅ Recovered ${partialHops.length} hops from partial output`);
+            return partialHops;
+          }
+        }
+      }
+      
       return [];
     }
   }
 
   /**
-   * Parse Windows tracert output
+   * Parse Windows tracert output - IMPROVED VERSION
    */
   parseWindowsTracert(output) {
     const lines = output.split('\n');
     const hops = [];
-    let hopNumber = 1;
+    let consecutiveTimeouts = 0;
+    const MAX_CONSECUTIVE_TIMEOUTS = 5; // Stop after 5 consecutive timeouts
 
     for (const line of lines) {
+      // Skip header and footer lines
       if (line.includes('Tracing route') || 
           line.includes('over a maximum') || 
           line.includes('Trace complete') ||
@@ -141,29 +158,74 @@ class TracerouteService {
         continue;
       }
 
+      // Match lines that start with hop number
+      const hopMatch = line.match(/^\s*(\d+)\s+/);
+      if (!hopMatch) continue;
+
+      const lineHopNum = parseInt(hopMatch[1]);
+      
+      // Check if this is a timeout line (contains asterisks or "Request timed out")
+      if (line.includes('*') || line.includes('Request timed out')) {
+        consecutiveTimeouts++;
+        
+        // Stop if too many consecutive timeouts (likely unreachable)
+        if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+          console.log(`⚠️  Stopped at hop ${lineHopNum} after ${MAX_CONSECUTIVE_TIMEOUTS} consecutive timeouts`);
+          break;
+        }
+        
+        hops.push({
+          hop: lineHopNum,
+          ip: null,
+          rtt: null,
+          loss: 100,
+          timeout: true
+        });
+        continue;
+      }
+
+      // Reset timeout counter on successful hop
+      consecutiveTimeouts = 0;
+
+      // Try to extract IP address
       const ipMatch = line.match(/(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/);
       
       if (ipMatch) {
         const ip = ipMatch[1];
-        const allTimes = [...line.matchAll(/(\d+)\s*ms/g)];
-        let rtt = 0;
         
-        if (allTimes.length > 0) {
-          const times = allTimes.map(m => parseInt(m[1]));
+        // Extract all time values from the line (looking for patterns like "10 ms", "<1 ms")
+        const timeMatches = [...line.matchAll(/(?:<)?(\d+)\s*ms/gi)];
+        let rtt = null;
+        let loss = 0;
+        
+        if (timeMatches.length > 0) {
+          // Calculate average RTT from available measurements
+          const times = timeMatches.map(m => {
+            const val = parseInt(m[1]);
+            return isNaN(val) ? 1 : val; // Handle "<1 ms" as 1ms
+          });
           rtt = times.reduce((a, b) => a + b, 0) / times.length;
+          
+          // Calculate packet loss if less than 3 measurements
+          if (times.length < 3) {
+            loss = ((3 - times.length) / 3) * 100;
+          }
+        } else {
+          // No time found, use 0
+          rtt = 0;
         }
 
         hops.push({
-          hop: hopNumber++,
+          hop: lineHopNum,
           ip: ip,
-          rtt: rtt || 0,
-          loss: 0
+          rtt: rtt,
+          loss: loss,
+          timeout: false
         });
-      } else if (line.match(/^\s*\d+\s+\*/)) {
-        hopNumber++;
       }
     }
 
+    console.log(`📊 Parsed ${hops.length} hops (${hops.filter(h => !h.timeout).length} active, ${hops.filter(h => h.timeout).length} timeouts)`);
     return hops;
   }
 
@@ -175,15 +237,16 @@ class TracerouteService {
     const hops = [];
 
     for (const line of lines) {
-      const match = line.match(/^\s*(\d+)\.\s+(\d+\.\d+\.\d+\.\d+)\s+[\d.]+%\s+\d+\s+([\d.]+)\s+([\d.]+)/);
+      const match = line.match(/^\s*(\d+)\.\s+(\d+\.\d+\.\d+\.\d+)\s+([\d.]+)%\s+\d+\s+([\d.]+)\s+([\d.]+)/);
       
       if (match) {
-        const [, hopNum, ip, lastRtt, avgRtt] = match;
+        const [, hopNum, ip, lossPercent, lastRtt, avgRtt] = match;
         hops.push({
           hop: parseInt(hopNum),
           ip: ip,
           rtt: parseFloat(avgRtt) || parseFloat(lastRtt) || 0,
-          loss: 0
+          loss: parseFloat(lossPercent) || 0,
+          timeout: false
         });
       }
     }
@@ -197,6 +260,8 @@ class TracerouteService {
   parseTracerouteOutput(output) {
     const lines = output.split('\n');
     const hops = [];
+    let consecutiveTimeouts = 0;
+    const MAX_CONSECUTIVE_TIMEOUTS = 5;
 
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
@@ -207,12 +272,31 @@ class TracerouteService {
       
       if (match) {
         const [, hopNum, ip, rtt] = match;
+        consecutiveTimeouts = 0;
         hops.push({
           hop: parseInt(hopNum),
           ip: ip,
           rtt: parseFloat(rtt),
-          loss: 0
+          loss: 0,
+          timeout: false
         });
+      } else if (line.match(/^\s*(\d+)\s+\*/)) {
+        consecutiveTimeouts++;
+        
+        if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS) {
+          break;
+        }
+        
+        const hopMatch = line.match(/^\s*(\d+)/);
+        if (hopMatch) {
+          hops.push({
+            hop: parseInt(hopMatch[1]),
+            ip: null,
+            rtt: null,
+            loss: 100,
+            timeout: true
+          });
+        }
       }
     }
 
@@ -226,6 +310,24 @@ class TracerouteService {
     const enriched = [];
 
     for (const hop of hops) {
+      // Handle timeout hops
+      if (hop.timeout || !hop.ip) {
+        enriched.push({
+          ...hop,
+          lat: null,
+          lon: null,
+          city: 'Unknown',
+          country: 'Unknown',
+          asn: 'Unknown',
+          asnOrg: 'Unknown',
+          isCdn: false,
+          cdnProvider: null,
+          routeType: 'land',
+          cableUsed: null
+        });
+        continue;
+      }
+
       const geo = geoService.getGeoLocation(hop.ip);
       const asn = await asnService.getASN(hop.ip);
 
@@ -239,7 +341,7 @@ class TracerouteService {
         asnOrg: asn.org,
         isCdn: asn.isCdn,
         cdnProvider: asn.cdnProvider,
-        routeType: 'land', // Default to land, will be updated by cable analysis
+        routeType: 'land',
         cableUsed: null
       });
     }
@@ -249,7 +351,6 @@ class TracerouteService {
 
   /**
    * Calculate distances between hops
-   * NOTE: routeType is now set by cable analysis, not by distance heuristic
    */
   calculateDistances(hops) {
     let totalDistance = 0;
@@ -260,6 +361,7 @@ class TracerouteService {
       const hop1 = hops[i];
       const hop2 = hops[i + 1];
 
+      // Skip if either hop has no coordinates
       if (!hop1.lat || !hop2.lat) continue;
 
       const distance = this.haversineDistance(
@@ -267,7 +369,6 @@ class TracerouteService {
         hop2.lat, hop2.lon
       );
 
-      // Use the routeType that was set by cable analysis
       const isSea = hop1.routeType === 'sea';
 
       if (isSea) {
@@ -324,13 +425,35 @@ class TracerouteService {
   }
 
   /**
-   * Calculate total one-way travel time
+   * Calculate total one-way travel time - FIXED VERSION
+   * RTT (Round Trip Time) needs to be divided by 2 for one-way latency
+   * BUT the last hop's RTT already represents the full path latency
    */
   calculateTotalTime(hops) {
     if (hops.length === 0) return 0;
     
-    const lastHop = hops[hops.length - 1];
-    return Math.round((lastHop.rtt / 2) * 1000) / 1000;
+    // Find the last valid (non-timeout) hop with RTT data
+    let lastValidHop = null;
+    for (let i = hops.length - 1; i >= 0; i--) {
+      if (hops[i].rtt !== null && !hops[i].timeout && hops[i].rtt > 0) {
+        lastValidHop = hops[i];
+        break;
+      }
+    }
+    
+    if (!lastValidHop) {
+      console.warn('⚠️  No valid RTT data found');
+      return 0;
+    }
+    
+    // The RTT at each hop represents round-trip time from source to that hop
+    // For total latency, we use the last hop's RTT directly (not divided by 2)
+    // because we want to show the full round-trip time to destination
+    const totalRtt = lastValidHop.rtt;
+    
+    console.log(`⏱️  Total RTT: ${totalRtt.toFixed(3)}ms (from hop ${lastValidHop.hop})`);
+    
+    return Math.round(totalRtt * 1000) / 1000; // Round to 3 decimal places
   }
 }
 
