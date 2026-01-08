@@ -8,11 +8,11 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const tracerouteRoutes = require('./routes/traceroute');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 5005;
 
 // Log environment loading status
 console.log('🔧 Environment Configuration:');
-console.log(`   PORT: ${process.env.PORT || '5000 (default)'}`);
+console.log(`   PORT: ${process.env.PORT || '5005 (default)'}`);
 console.log(`   NODE_ENV: ${process.env.NODE_ENV || 'undefined'}`);
 console.log(`   SUPABASE_URL: ${process.env.SUPABASE_URL ? '✅ Loaded' : '❌ Missing'}`);
 console.log(`   SUPABASE_KEY: ${process.env.SUPABASE_KEY ? '✅ Loaded' : '❌ Missing'}`);
